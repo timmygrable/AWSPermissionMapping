@@ -1,203 +1,156 @@
 import boto3
 import json
-import re
-import time
 import logging
 from botocore.exceptions import ClientError, ParamValidationError
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
-import random
-
-import backoff
+from typing import Dict, List
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 5
-BASE_DELAY = 1
-MAX_DELAY = 60
-
 class AWSPermissionMapper:
-    def __init__(self, service: str, region: str = "us-east-1", max_workers: int = 10):
+    def __init__(self, service: str, region: str = "us-east-1"):
         self.service = service
         self.region = region
-        self.max_workers = max_workers
         self.iam = boto3.client("iam")
-        self.client = boto3.client(service, region_name=region)
-        self.role_name: Optional[str] = None
+        self.role_name = f"PermissionMapper-{self.service}"
+        self.role_arn = self.create_iam_role()
+        self.client = boto3.client(self.service, region_name=self.region)
+        self.policy_name = f"PermissionMapper-Policy-{self.service}"
+        self.policy_arn = self.create_policy()
 
-    @backoff.on_exception(backoff.expo, ClientError, max_tries=MAX_RETRIES, jitter=backoff.full_jitter)
-    def create_test_role(self) -> Optional[str]:
-        role_name = f"TempTestRole-{int(time.time())}"
+    def create_policy(self):
         try:
-            self.iam.create_role(
-                RoleName=role_name,
+            response = self.iam.create_policy(
+                PolicyName=self.policy_name,
+                PolicyDocument=json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": []
+                })
+            )
+            policy_arn = response['Policy']['Arn']
+            self.iam.attach_role_policy(RoleName=self.role_name, PolicyArn=policy_arn)
+            return policy_arn
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "EntityAlreadyExists":
+                logger.info(f"IAM policy {self.policy_name} already exists")
+                return self.iam.get_policy(PolicyArn=f"arn:aws:iam::{boto3.client('sts').get_caller_identity()['Account']}:policy/{self.policy_name}")['Policy']['Arn']
+            logger.error(f"Error creating IAM policy: {e}")
+            raise
+
+    def create_iam_role(self) -> str:
+        try:
+            response = self.iam.create_role(
+                RoleName=self.role_name,
                 AssumeRolePolicyDocument=json.dumps({
                     "Version": "2012-10-17",
                     "Statement": [{
                         "Effect": "Allow",
                         "Principal": {"Service": f"{self.service}.amazonaws.com"},
                         "Action": "sts:AssumeRole",
-                    }],
-                }),
+                    }]
+                })
             )
-            self.iam.get_waiter("role_exists").wait(RoleName=role_name)
-            return role_name
+            logger.info(f"Created IAM role: {self.role_name}")
+            return response["Role"]["Arn"]
         except ClientError as e:
-            logger.error(f"Error creating role: {e}")
-            return None
+            if e.response["Error"]["Code"] == "EntityAlreadyExists":
+                logger.info(f"IAM role {self.role_name} already exists")
+                return self.iam.get_role(RoleName=self.role_name)["Role"]["Arn"]
+            logger.error(f"Error creating IAM role: {e}")
+            raise
 
-    @backoff.on_exception(backoff.expo, ClientError, max_tries=MAX_RETRIES, jitter=backoff.full_jitter)
-    def delete_test_role(self):
-        if not self.role_name:
-            return
+    def delete_iam_role_and_policy(self):
         try:
-            for policy in self.iam.list_role_policies(RoleName=self.role_name)["PolicyNames"]:
-                self.iam.delete_role_policy(RoleName=self.role_name, PolicyName=policy)
+            self.iam.detach_role_policy(RoleName=self.role_name, PolicyArn=self.policy_arn)
+            self.iam.delete_policy(PolicyArn=self.policy_arn)
             self.iam.delete_role(RoleName=self.role_name)
+            logger.info(f"Deleted IAM role and policy: {self.role_name}")
         except ClientError as e:
-            logger.error(f"Error during cleanup: {e}")
+            logger.error(f"Error deleting IAM role and policy: {e}")
 
-    @backoff.on_exception(backoff.expo, (ClientError, ParamValidationError), max_tries=MAX_RETRIES, jitter=backoff.full_jitter)
-    def get_required_permissions(self, sdk_call: str) -> Tuple[str, List[str]]:
-        permissions = set()
+    def add_permission_to_policy(self, permission: str):
         try:
-            getattr(self.client, sdk_call)()
-            return sdk_call, list(permissions)
-        except ParamValidationError:
-            self._handle_param_validation_error(sdk_call, permissions)
-        except ClientError as e:
-            self._handle_client_error(e, sdk_call, permissions)
-        except Exception as e:
-            logger.error(f"Unexpected exception for {sdk_call}: {str(e)}")
-        
-        return sdk_call, list(permissions)
+            policy = self.iam.get_policy_version(
+                PolicyArn=self.policy_arn,
+                VersionId=self.iam.get_policy(PolicyArn=self.policy_arn)['Policy']['DefaultVersionId']
+            )['PolicyVersion']['Document']
 
-    def _handle_param_validation_error(self, sdk_call: str, permissions: set):
-        try:
-            self.iam.simulate_principal_policy(
-                PolicySourceArn=f'arn:aws:iam::{self.iam.get_user()["User"]["Arn"].split(":")[4]}:role/{self.role_name}',
-                ActionNames=[self.format_iam_action(self.service, sdk_call)],
+            if not policy['Statement']:
+                policy['Statement'] = []
+
+            policy['Statement'].append({
+                "Effect": "Allow",
+                "Action": permission,
+                "Resource": "*"
+            })
+
+            self.iam.create_policy_version(
+                PolicyArn=self.policy_arn,
+                PolicyDocument=json.dumps(policy),
+                SetAsDefault=True
             )
-        except ClientError as sim_error:
-            if sim_error.response["Error"]["Code"] == "AccessDenied":
-                permissions.add(self.format_iam_action(self.service, sdk_call))
-
-    def _handle_client_error(self, e: ClientError, sdk_call: str, permissions: set):
-        error_code = e.response["Error"]["Code"]
-        error_message = e.response["Error"]["Message"]
-
-        if error_code == "AccessDeniedException":
-            match = re.search(r"is not authorized to perform: ([\w:]+)", error_message)
-            if match:
-                permissions.add(match.group(1))
-                self._update_role_policy(permissions)
-            else:
-                logger.warning(f"Couldn't parse permission from error: {error_message}")
-        elif error_code == "DryRunOperation":
-            return
-        else:
-            logger.warning(f"ClientError for {sdk_call}: {error_code} - {error_message}")
-
-    @backoff.on_exception(backoff.expo, ClientError, max_tries=MAX_RETRIES, jitter=backoff.full_jitter)
-    def _update_role_policy(self, permissions: set):
-        try:
-            self.iam.put_role_policy(
-                RoleName=self.role_name,
-                PolicyName="TempPolicy",
-                PolicyDocument=json.dumps({
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {"Effect": "Allow", "Action": list(permissions), "Resource": "*"}
-                    ],
-                }),
-            )
+            logger.info(f"Added permission {permission} to policy")
         except ClientError as e:
-            logger.error(f"Error updating role policy: {e}")
+            logger.error(f"Error adding permission to policy: {e}")
+
+    def attempt_sdk_call(self, sdk_call: str) -> List[str]:
+        method = getattr(self.client, sdk_call)
+        required_permissions = []
+
+        while True:
+            try:
+                method()
+                break
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "AccessDenied":
+                    error_message = e.response["Error"]["Message"]
+                    permission = error_message.split("perform: ")[1].split(" on resource")[0]
+                    if permission not in required_permissions:
+                        required_permissions.append(permission)
+                        self.add_permission_to_policy(permission)
+                    else:
+                        logger.warning(f"Permission {permission} already added but still getting AccessDenied")
+                        break
+                elif e.response["Error"]["Code"] == "ParamValidationError":
+                    break
+                else:
+                    logger.warning(f"Unexpected error in {sdk_call}: {str(e)}")
+                    break
+            except ParamValidationError:
+                break
+            except Exception as e:
+                logger.warning(f"Unexpected error in {sdk_call}: {str(e)}")
+                break
+
+        return required_permissions
 
     def map_service_permissions(self) -> Dict[str, List[str]]:
-        self.role_name = self.create_test_role()
-        if not self.role_name:
-            logger.error("Failed to create test role. Aborting permission mapping.")
-            return {}
-
         service_permissions = {}
-        api_to_method = {v: k for k, v in self.client.meta.method_to_api_mapping.items()}
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_sdk_call = {
-                executor.submit(self.get_required_permissions, api_to_method[api_action]): api_action
-                for api_action in self.client.meta.service_model.operation_names
-                if api_action in api_to_method
-            }
-
-            for future in as_completed(future_to_sdk_call):
-                try:
-                    sdk_call, permissions = future.result()
-                    if permissions:
-                        service_permissions[sdk_call] = permissions
-                except Exception as e:
-                    logger.error(f"Error processing SDK call: {e}")
-
-        self.delete_test_role()
+        for sdk_call in self.client.meta.method_to_api_mapping.keys():
+            permissions = self.attempt_sdk_call(sdk_call)
+            if permissions:
+                service_permissions[sdk_call] = permissions
         return service_permissions
 
-    @staticmethod
-    def format_iam_action(service: str, action: str) -> str:
-        formatted_action = "".join(word.capitalize() for word in action.split("_"))
-        return f"{service}:{formatted_action}"
-
-def get_all_aws_services() -> List[str]:
-    session = boto3.Session()
-    return session.get_available_services()
-
-def map_all_services(region: str = "us-east-1") -> Dict[str, Dict[str, List[str]]]:
-    all_services = get_all_aws_services()
-    all_permissions = {}
-
-    for service in all_services:
-        logger.info(f"Mapping permissions for {service}...")
-        mapper = AWSPermissionMapper(service, region)
+def map_service_permissions(service: str, region: str = "us-east-1") -> Dict[str, Dict[str, List[str]]]:
+    mapper = AWSPermissionMapper(service, region)
+    try:
         permissions = mapper.map_service_permissions()
-        if permissions:
-            all_permissions[service] = permissions
-        logger.info(f"Finished mapping permissions for {service}")
-
-    return all_permissions
+        return {service: permissions}
+    finally:
+        mapper.delete_iam_role_and_policy()
 
 def main():
-    print("1. Map permissions for a single AWS service")
-    print("2. Map permissions for all AWS services")
-    choice = input("Enter your choice (1 or 2): ")
+    service = input("Enter the AWS service name (e.g., 'lambda', 's3'): ")
+    permissions = map_service_permissions(service, "us-east-1")
+    output_file = f"{service}_permissions.json"
 
-    region = "us-east-1"
-
-    if choice == "1":
-        service = input("Enter the AWS service name (e.g., 'lambda', 's3'): ")
-        mapper = AWSPermissionMapper(service, region)
-        permissions = mapper.map_service_permissions()
-
-        if permissions:
-            output_file = f"{service}_permissions.json"
-            with open(output_file, "w") as f:
-                json.dump(permissions, f, indent=2)
-            logger.info(f"Permissions mapping for {service} saved to {output_file}")
-        else:
-            logger.warning(f"No permissions were mapped for {service}. Check your AWS credentials and permissions.")
-
-    elif choice == "2":
-        all_permissions = map_all_services(region)
-
-        if all_permissions:
-            output_file = "all_aws_permissions.json"
-            with open(output_file, "w") as f:
-                json.dump(all_permissions, f, indent=2)
-            logger.info(f"Permissions mapping for all services saved to {output_file}")
-        else:
-            logger.warning("No permissions were mapped. Check your AWS credentials and permissions.")
-
+    if permissions:
+        with open(output_file, "w") as f:
+            json.dump(permissions, f, indent=2)
+        logger.info(f"Permissions mapping saved to {output_file}")
     else:
-        logger.error("Invalid choice. Please run the script again and choose 1 or 2.")
+        logger.warning("No permissions were mapped. Check your AWS credentials and permissions.")
 
 if __name__ == "__main__":
     main()
